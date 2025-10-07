@@ -1,0 +1,638 @@
+# ============================================================================
+# FILE: nexus/streamlit_ui/a2a_orchestration_chat.py
+# Streamlit UI for A2A Orchestration Chat
+# ============================================================================
+import streamlit as st
+import asyncio
+from nexus.streamlit_ui.cache import get_nexus
+
+
+def a2a_orchestration_page(username, win_height):
+    """A2A Orchestration Chat Page"""
+    nexus = get_nexus()
+    user = nexus.get_participant(username)
+    
+    if user is None:
+        st.error("Invalid user")
+        st.stop()
+    
+    # Initialize A2A if not already done
+    if "a2a_initialized" not in st.session_state:
+        asyncio.run(nexus.start_a2a_server())
+        st.session_state["a2a_initialized"] = True
+    
+    # Initialize session state for A2A threads
+    if "a2a_threads" not in st.session_state:
+        threads = nexus.get_threads_for_user(username, type="a2a")
+        st.session_state["a2a_threads"] = threads
+    
+    if "a2a_current_thread_id" not in st.session_state:
+        st.session_state["a2a_current_thread_id"] = None
+    
+    if "a2a_selected_orchestration" not in st.session_state:
+        st.session_state["a2a_selected_orchestration"] = None
+    
+    def select_thread(thread_id):
+        st.session_state["a2a_current_thread_id"] = thread_id
+    
+    def create_new_thread():
+        new_thread_id = (
+            len(st.session_state["a2a_threads"]) + 1 
+            if st.session_state["a2a_threads"] else 1
+        )
+        thread = nexus.create_thread(
+            f"A2A Chat: {new_thread_id}", 
+            username, 
+            type="a2a"
+        )
+        st.session_state["a2a_threads"].insert(0, thread)
+        select_thread(thread.thread_id)
+    
+    # Sidebar
+    st.sidebar.title("Nexus -> A2A Orchestration")
+    
+    with st.sidebar.container(height=win_height - 400):
+        st.button("+ New A2A Chat", on_click=create_new_thread)
+        
+        st.header("Recent chats")
+        for thread in st.session_state["a2a_threads"]:
+            if st.button(thread.title, key=f"thread_{thread.thread_id}"):
+                select_thread(thread.thread_id)
+    
+    # Orchestration Selector
+    with st.sidebar:
+        st.divider()
+        st.subheader("Orchestration Selection")
+        
+        # List available orchestrations
+        orchestrations = nexus.list_a2a_orchestrations()
+        
+        if not orchestrations:
+            st.info("No orchestrations configured. Create a YAML config in nexus/nexus_base/a2a_configs/")
+        else:
+            selected = st.selectbox(
+                "Select Orchestration",
+                orchestrations,
+                key="orch_select"
+            )
+            
+            if st.button("Load Orchestration"):
+                try:
+                    orchestration = nexus.load_a2a_orchestration(selected)
+                    st.session_state["a2a_selected_orchestration"] = selected
+                    st.success(f"Loaded: {selected}")
+                except Exception as e:
+                    st.error(f"Error loading orchestration: {e}")
+        
+        # Show current orchestration info
+        if st.session_state["a2a_selected_orchestration"]:
+            st.divider()
+            st.subheader("Current Orchestration")
+            st.write(f"**Name:** {st.session_state['a2a_selected_orchestration']}")
+            
+            # Get orchestration status
+            orch = nexus.get_a2a_manager().get_orchestration(
+                st.session_state["a2a_selected_orchestration"]
+            )
+            if orch:
+                status = orch.get_status()
+                st.write(f"**Orchestrator:** {status['orchestrator']}")
+                
+                with st.expander("Agents"):
+                    for agent in status['agents']:
+                        st.write(f"- {agent['name']} ({agent['type']}): {agent['status']}")
+                
+                with st.expander("Workflows"):
+                    for workflow in status['workflows']:
+                        st.write(f"- {workflow}")
+    
+    # Main chat UI
+    if st.session_state["a2a_current_thread_id"] is not None:
+        current_thread = nexus.get_thread(st.session_state["a2a_current_thread_id"])
+        
+        if current_thread:
+            st.title(f"🤝 {current_thread.title}")
+            
+            # Check if orchestration is selected
+            if not st.session_state["a2a_selected_orchestration"]:
+                st.warning("Please select and load an orchestration from the sidebar first.")
+                return
+            
+            # Mode selector
+            mode = st.radio(
+                "Execution Mode",
+                ["Interactive", "Workflow"],
+                horizontal=True,
+                help="Interactive: Chat with orchestrator | Workflow: Execute predefined workflow"
+            )
+            
+            # Workflow selector if in workflow mode
+            selected_workflow = None
+            if mode == "Workflow":
+                orch = nexus.get_a2a_manager().get_orchestration(
+                    st.session_state["a2a_selected_orchestration"]
+                )
+                if orch:
+                    workflows = [w['name'] for w in orch.config.workflows]
+                    selected_workflow = st.selectbox("Select Workflow", workflows)
+            
+            # Chat messages container
+            with st.container(height=win_height - 350):
+                messages = nexus.read_messages(current_thread.thread_id)
+                for message in messages:
+                    with st.chat_message(
+                        message.author.username, 
+                        avatar=message.author.avatar
+                    ):
+                        st.markdown(message.content)
+                
+                placeholder = st.empty()
+            
+            # Chat input
+            user_input = st.chat_input(
+                "Type your message here:", 
+                key="a2a_msg_input"
+            )
+            
+            if user_input:
+                with placeholder.container():
+                    # User message
+                    with st.chat_message(username, avatar=user.avatar):
+                        st.markdown(user_input)
+                        nexus.post_message(
+                            current_thread.thread_id, 
+                            username, 
+                            "user", 
+                            user_input
+                        )
+                    
+                    # Agent response
+                    with st.chat_message("A2A System", avatar="🤝"):
+                        with st.spinner(text="Agents collaborating..."):
+                            try:
+                                if mode == "Interactive":
+                                    # Interactive mode
+                                    response = asyncio.run(
+                                        nexus.a2a_manager.chat_with_orchestration(
+                                            st.session_state["a2a_selected_orchestration"],
+                                            user_input
+                                        )
+                                    )
+                                else:
+                                    # Workflow mode
+                                    results = asyncio.run(
+                                        nexus.a2a_manager.execute_workflow(
+                                            st.session_state["a2a_selected_orchestration"],
+                                            selected_workflow,
+                                            user_input
+                                        )
+                                    )
+                                    response = "**Workflow Results:**\n\n"
+                                    for agent, result in results.items():
+                                        response += f"**{agent}:**\n{result}\n\n"
+                                
+                                st.markdown(response)
+                                
+                                # Save response
+                                nexus.post_message(
+                                    current_thread.thread_id,
+                                    "A2A System",
+                                    "agent",
+                                    response
+                                )
+                            
+                            except Exception as e:
+                                error_msg = f"Error: {str(e)}"
+                                st.error(error_msg)
+                                nexus.post_message(
+                                    current_thread.thread_id,
+                                    "A2A System",
+                                    "system",
+                                    error_msg
+                                )
+                
+                st.rerun()
+
+
+# ============================================================================
+# FILE: nexus/streamlit_ui/a2a_network_monitor.py
+# Network monitoring dashboard
+# ============================================================================
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+from nexus.streamlit_ui.cache import get_nexus
+
+
+def a2a_network_page(username, win_height):
+    """A2A Network Monitoring Page"""
+    nexus = get_nexus()
+    
+    st.title("🌐 A2A Network Monitor")
+    
+    # Auto-refresh
+    if st.button("🔄 Refresh"):
+        st.rerun()
+    
+    # Get network status
+    try:
+        status = nexus.get_a2a_network_status()
+    except:
+        st.error("A2A Server not initialized. Please start a chat first.")
+        return
+    
+    # Overview metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Agents", status['total_agents'])
+    
+    with col2:
+        st.metric("Online Agents", status['online_agents'])
+    
+    with col3:
+        st.metric("Orchestrations", status['orchestrations'])
+    
+    with col4:
+        st.metric("Messages", status['message_count'])
+    
+    st.divider()
+    
+    # Agents table
+    st.subheader("Registered Agents")
+    
+    if status['agents']:
+        agents_df = pd.DataFrame(status['agents'])
+        st.dataframe(
+            agents_df,
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No agents registered yet")
+    
+    st.divider()
+    
+    # Orchestrations
+    st.subheader("Active Orchestrations")
+    
+    a2a_mgr = nexus.get_a2a_manager()
+    orchestrations = a2a_mgr.server.orchestrations
+    
+    if orchestrations:
+        for name, orch in orchestrations.items():
+            with st.expander(f"📋 {name}"):
+                status_info = orch.get_status()
+                st.write(f"**Description:** {status_info['description']}")
+                st.write(f"**Orchestrator:** {status_info['orchestrator']}")
+                
+                st.write("**Agents:**")
+                for agent in status_info['agents']:
+                    status_icon = "🟢" if agent['status'] == "online" else "🔴"
+                    st.write(f"{status_icon} {agent['name']} ({agent['type']})")
+                
+                st.write("**Workflows:**")
+                for workflow in status_info['workflows']:
+                    st.write(f"- {workflow}")
+    else:
+        st.info("No active orchestrations")
+    
+    st.divider()
+    
+    # Message log
+    st.subheader("Recent Messages")
+    
+    transport = a2a_mgr.server.transport
+    messages = transport.get_message_history(limit=20)
+    
+    if messages:
+        for msg in reversed(messages):
+            timestamp = datetime.fromisoformat(msg.timestamp).strftime("%H:%M:%S")
+            st.text(f"[{timestamp}] {msg.from_agent} → {msg.to_agent}: {msg.message_type}")
+    else:
+        st.info("No messages yet")
+
+
+# ============================================================================
+# FILE: nexus/streamlit_ui/a2a_config_editor.py
+# Configuration editor for orchestrations
+# ============================================================================
+import streamlit as st
+import yaml
+from pathlib import Path
+from nexus.streamlit_ui.cache import get_nexus
+
+
+def a2a_config_page(username, win_height):
+    """A2A Configuration Editor"""
+    nexus = get_nexus()
+    
+    st.title("⚙️ A2A Configuration Editor")
+    
+    config_dir = Path(nexus.a2a_manager.config_directory)
+    
+    # Tabs
+    tab1, tab2 = st.tabs(["Edit Existing", "Create New"])
+    
+    with tab1:
+        st.subheader("Edit Existing Configuration")
+        
+        configs = list(config_dir.glob("*.yaml"))
+        
+        if configs:
+            selected_file = st.selectbox(
+                "Select Configuration",
+                [f.stem for f in configs]
+            )
+            
+            if selected_file:
+                file_path = config_dir / f"{selected_file}.yaml"
+                
+                with open(file_path, 'r') as f:
+                    content = f.read()
+                
+                edited_content = st.text_area(
+                    "YAML Configuration",
+                    content,
+                    height=400
+                )
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("💾 Save"):
+                        try:
+                            # Validate YAML
+                            yaml.safe_load(edited_content)
+                            
+                            with open(file_path, 'w') as f:
+                                f.write(edited_content)
+                            
+                            st.success("Configuration saved!")
+                        except yaml.YAMLError as e:
+                            st.error(f"Invalid YAML: {e}")
+                
+                with col2:
+                    if st.button("🗑️ Delete"):
+                        file_path.unlink()
+                        st.success("Configuration deleted!")
+                        st.rerun()
+        else:
+            st.info("No configurations found")
+    
+    with tab2:
+        st.subheader("Create New Configuration")
+        
+        new_name = st.text_input("Configuration Name")
+        
+        template = """orchestration:
+  name: "my_team"
+  description: "Description of the orchestration"
+  orchestrator: "coordinator_agent"
+  
+  agents:
+    - name: "coordinator_agent"
+      role: "orchestrator"
+      profile: "profiles/adam.yaml"
+      
+    - name: "worker_agent"
+      role: "worker"
+      profile: "profiles/adam.yaml"
+  
+  communication_patterns:
+    - from: "coordinator_agent"
+      to: ["worker_agent"]
+      mode: "direct"
+      
+    - from: "worker_agent"
+      to: ["coordinator_agent"]
+      mode: "response"
+  
+  workflows:
+    - name: "simple_workflow"
+      description: "A simple workflow"
+      steps:
+        - agent: "coordinator_agent"
+          action: "coordinate"
+          output_to: ["worker_agent"]
+          
+        - agent: "worker_agent"
+          action: "process"
+          output_to: ["coordinator_agent"]
+          
+        - agent: "coordinator_agent"
+          action: "finalize"
+"""
+        
+        new_content = st.text_area(
+            "YAML Configuration",
+            template,
+            height=400
+        )
+        
+        if st.button("Create"):
+            if not new_name:
+                st.error("Please provide a name")
+            else:
+                try:
+                    # Validate YAML
+                    yaml.safe_load(new_content)
+                    
+                    file_path = config_dir / f"{new_name}.yaml"
+                    
+                    if file_path.exists():
+                        st.error("Configuration already exists")
+                    else:
+                        with open(file_path, 'w') as f:
+                            f.write(new_content)
+                        
+                        st.success(f"Configuration {new_name} created!")
+                except yaml.YAMLError as e:
+                    st.error(f"Invalid YAML: {e}")
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a_configs/research_team.yaml
+# Example orchestration configuration
+# ============================================================================
+RESEARCH_TEAM_CONFIG = """orchestration:
+  name: "research_team"
+  description: "Coordinates research, analysis, and writing tasks"
+  orchestrator: "coordinator_agent"
+  
+  agents:
+    - name: "coordinator_agent"
+      role: "orchestrator"
+      profile: "adam"
+      
+    - name: "researcher_agent"
+      role: "worker"
+      profile: "adam"
+      
+    - name: "analyst_agent"
+      role: "worker"
+      profile: "adam"
+      
+    - name: "writer_agent"
+      role: "worker"
+      profile: "adam"
+  
+  communication_patterns:
+    - from: "coordinator_agent"
+      to: ["researcher_agent", "analyst_agent", "writer_agent"]
+      mode: "broadcast"
+      
+    - from: "researcher_agent"
+      to: ["analyst_agent", "coordinator_agent"]
+      mode: "direct"
+      
+    - from: "analyst_agent"
+      to: ["writer_agent", "coordinator_agent"]
+      mode: "direct"
+      
+    - from: "writer_agent"
+      to: ["coordinator_agent"]
+      mode: "response"
+  
+  workflows:
+    - name: "research_and_report"
+      description: "Research a topic and generate a comprehensive report"
+      steps:
+        - agent: "coordinator_agent"
+          action: "decompose_task"
+          output_to: ["researcher_agent"]
+          
+        - agent: "researcher_agent"
+          action: "gather_information"
+          output_to: ["analyst_agent"]
+          
+        - agent: "analyst_agent"
+          action: "analyze_data"
+          output_to: ["writer_agent"]
+          
+        - agent: "writer_agent"
+          action: "create_report"
+          output_to: ["coordinator_agent"]
+          
+        - agent: "coordinator_agent"
+          action: "finalize"
+    
+    - name: "quick_research"
+      description: "Quick research without full analysis"
+      steps:
+        - agent: "coordinator_agent"
+          action: "identify_topic"
+          output_to: ["researcher_agent"]
+          
+        - agent: "researcher_agent"
+          action: "quick_search"
+          output_to: ["coordinator_agent"]
+          
+        - agent: "coordinator_agent"
+          action: "summarize"
+"""
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a_configs/content_team.yaml
+# ============================================================================
+CONTENT_TEAM_CONFIG = """orchestration:
+  name: "content_creation_team"
+  description: "Creates and edits content with multiple agents"
+  orchestrator: "editor_agent"
+  
+  agents:
+    - name: "editor_agent"
+      role: "orchestrator"
+      profile: "adam"
+      
+    - name: "ideator_agent"
+      role: "worker"
+      profile: "adam"
+      
+    - name: "writer_agent"
+      role: "worker"
+      profile: "adam"
+      
+    - name: "reviewer_agent"
+      role: "worker"
+      profile: "adam"
+  
+  communication_patterns:
+    - from: "editor_agent"
+      to: ["ideator_agent", "writer_agent", "reviewer_agent"]
+      
+    - from: "ideator_agent"
+      to: ["writer_agent", "editor_agent"]
+      
+    - from: "writer_agent"
+      to: ["reviewer_agent", "editor_agent"]
+      
+    - from: "reviewer_agent"
+      to: ["editor_agent", "writer_agent"]
+  
+  workflows:
+    - name: "create_article"
+      description: "Create a complete article from ideation to review"
+      steps:
+        - agent: "editor_agent"
+          action: "define_requirements"
+          output_to: ["ideator_agent"]
+          
+        - agent: "ideator_agent"
+          action: "brainstorm_ideas"
+          output_to: ["writer_agent"]
+          
+        - agent: "writer_agent"
+          action: "write_draft"
+          output_to: ["reviewer_agent"]
+          
+        - agent: "reviewer_agent"
+          action: "review_content"
+          output_to: ["editor_agent"]
+          
+        - agent: "editor_agent"
+          action: "finalize"
+"""
+
+# ============================================================================
+# Update nexus/streamlit_ui/main.py to add A2A pages
+# ============================================================================
+# Add these imports at the top:
+# from nexus.streamlit_ui.a2a_orchestration_chat import a2a_orchestration_page
+# from nexus.streamlit_ui.a2a_network_monitor import a2a_network_page
+# from nexus.streamlit_ui.a2a_config_editor import a2a_config_page
+
+# Add to the page navigation:
+# pages = {
+#     "Agent Chat": agent_chat_page,
+#     "Assistants": assistants_page,
+#     "A2A Orchestration": a2a_orchestration_page,  # NEW
+#     "A2A Network": a2a_network_page,              # NEW
+#     "A2A Config": a2a_config_page,                # NEW
+#     ...
+# }
+
+# ============================================================================
+# Installation script to set up example configs
+# ============================================================================
+def setup_a2a_configs():
+    """Setup example A2A configurations"""
+    from pathlib import Path
+    
+    # Get config directory
+    config_dir = Path(__file__).parent / "nexus_base" / "a2a_configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Write research team config
+    with open(config_dir / "research_team.yaml", 'w') as f:
+        f.write(RESEARCH_TEAM_CONFIG)
+    
+    # Write content team config
+    with open(config_dir / "content_team.yaml", 'w') as f:
+        f.write(CONTENT_TEAM_CONFIG)
+    
+    print("A2A configurations created successfully!")
+    print(f"Location: {config_dir}")
+
+if __name__ == "__main__":
+    setup_a2a_configs()
