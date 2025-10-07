@@ -1,0 +1,912 @@
+# ============================================================================
+# FILE: nexus/api/a2a_routes.py
+# FastAPI routes for A2A functionality
+# ============================================================================
+from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from nexus.nexus_base.nexus import Nexus
+
+router = APIRouter(prefix="/a2a", tags=["A2A"])
+
+
+class OrchestrationRequest(BaseModel):
+    orchestration_name: str
+    input_data: str
+
+
+class WorkflowRequest(BaseModel):
+    orchestration_name: str
+    workflow_name: str
+    input_data: str
+
+
+class AgentDiscoveryQuery(BaseModel):
+    agent_type: Optional[str] = None
+    capability: Optional[str] = None
+    status: Optional[str] = None
+
+
+def get_nexus():
+    """Dependency to get Nexus instance"""
+    from nexus.api.main import chat
+    return chat()
+
+
+@router.post("/start")
+async def start_a2a_server(nexus: Nexus = Depends(get_nexus)):
+    """Start the A2A server"""
+    try:
+        await nexus.start_a2a_server()
+        return {"status": "success", "message": "A2A server started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/orchestrations")
+async def list_orchestrations(nexus: Nexus = Depends(get_nexus)):
+    """List available orchestration configurations"""
+    try:
+        orchestrations = nexus.list_a2a_orchestrations()
+        return {"orchestrations": orchestrations}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orchestrations/{name}/load")
+async def load_orchestration(name: str, nexus: Nexus = Depends(get_nexus)):
+    """Load an orchestration configuration"""
+    try:
+        orch = nexus.load_a2a_orchestration(name)
+        status = orch.get_status()
+        return {"status": "success", "orchestration": status}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Orchestration {name} not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orchestrations/chat")
+async def chat_with_orchestration(
+    request: OrchestrationRequest,
+    nexus: Nexus = Depends(get_nexus)
+):
+    """Interactive chat with an orchestration"""
+    try:
+        response = await nexus.a2a_manager.chat_with_orchestration(
+            request.orchestration_name,
+            request.input_data
+        )
+        return {"response": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orchestrations/workflow")
+async def execute_workflow(
+    request: WorkflowRequest,
+    nexus: Nexus = Depends(get_nexus)
+):
+    """Execute a workflow"""
+    try:
+        results = await nexus.a2a_manager.execute_workflow(
+            request.orchestration_name,
+            request.workflow_name,
+            request.input_data
+        )
+        return {"results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/network/status")
+async def get_network_status(nexus: Nexus = Depends(get_nexus)):
+    """Get A2A network status"""
+    try:
+        status = nexus.get_a2a_network_status()
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/agents/discover")
+async def discover_agents(
+    query: AgentDiscoveryQuery,
+    nexus: Nexus = Depends(get_nexus)
+):
+    """Discover agents by criteria"""
+    try:
+        filters = {}
+        if query.agent_type:
+            filters['agent_type'] = query.agent_type
+        if query.capability:
+            filters['capability'] = query.capability
+        if query.status:
+            filters['status'] = query.status
+        
+        agents = nexus.a2a_manager.discover_agents(**filters)
+        return {
+            "agents": [agent.to_dict() for agent in agents]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/messages/history")
+async def get_message_history(
+    limit: int = 100,
+    nexus: Nexus = Depends(get_nexus)
+):
+    """Get A2A message history"""
+    try:
+        messages = nexus.a2a_manager.server.transport.get_message_history(limit)
+        return {
+            "messages": [msg.to_dict() for msg in messages]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Add to main.py
+# from nexus.api.a2a_routes import router as a2a_router
+# app.include_router(a2a_router)
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/conversation_manager.py
+# Manages multi-turn conversations in A2A
+# ============================================================================
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from datetime import datetime
+import uuid
+
+
+@dataclass
+class ConversationTurn:
+    """Single turn in a conversation"""
+    turn_id: str
+    agent: str
+    message: str
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    metadata: Dict = field(default_factory=dict)
+
+
+class Conversation:
+    """Manages a multi-agent conversation"""
+    
+    def __init__(self, conversation_id: Optional[str] = None, topic: str = ""):
+        self.conversation_id = conversation_id or str(uuid.uuid4())
+        self.topic = topic
+        self.turns: List[ConversationTurn] = []
+        self.participants: List[str] = []
+        self.created_at = datetime.now().isoformat()
+        self.metadata: Dict = {}
+    
+    def add_turn(self, agent: str, message: str, **metadata):
+        """Add a turn to the conversation"""
+        turn = ConversationTurn(
+            turn_id=str(uuid.uuid4()),
+            agent=agent,
+            message=message,
+            metadata=metadata
+        )
+        self.turns.append(turn)
+        
+        if agent not in self.participants:
+            self.participants.append(agent)
+        
+        return turn
+    
+    def get_history(self, limit: Optional[int] = None) -> List[ConversationTurn]:
+        """Get conversation history"""
+        if limit:
+            return self.turns[-limit:]
+        return self.turns
+    
+    def get_context(self, format: str = "string") -> str:
+        """Get conversation context for agents"""
+        if format == "string":
+            context = f"Topic: {self.topic}\n\n"
+            for turn in self.turns:
+                context += f"{turn.agent}: {turn.message}\n"
+            return context
+        elif format == "json":
+            return {
+                "topic": self.topic,
+                "turns": [
+                    {"agent": t.agent, "message": t.message}
+                    for t in self.turns
+                ]
+            }
+        return ""
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
+        return {
+            "conversation_id": self.conversation_id,
+            "topic": self.topic,
+            "participants": self.participants,
+            "turns": [
+                {
+                    "turn_id": t.turn_id,
+                    "agent": t.agent,
+                    "message": t.message,
+                    "timestamp": t.timestamp
+                }
+                for t in self.turns
+            ],
+            "created_at": self.created_at
+        }
+
+
+class ConversationManager:
+    """Manages multiple conversations"""
+    
+    def __init__(self):
+        self.conversations: Dict[str, Conversation] = {}
+    
+    def create_conversation(self, topic: str = "") -> Conversation:
+        """Create a new conversation"""
+        conv = Conversation(topic=topic)
+        self.conversations[conv.conversation_id] = conv
+        return conv
+    
+    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Get a conversation by ID"""
+        return self.conversations.get(conversation_id)
+    
+    def add_turn(self, conversation_id: str, agent: str, message: str, **metadata):
+        """Add turn to a conversation"""
+        conv = self.get_conversation(conversation_id)
+        if conv:
+            return conv.add_turn(agent, message, **metadata)
+        return None
+    
+    def list_conversations(self) -> List[str]:
+        """List all conversation IDs"""
+        return list(self.conversations.keys())
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/delegation_manager.py
+# Manages task delegation between agents
+# ============================================================================
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Optional, Callable
+import asyncio
+
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Task:
+    """Represents a delegated task"""
+    task_id: str
+    description: str
+    assigned_to: Optional[str] = None
+    status: TaskStatus = TaskStatus.PENDING
+    created_by: Optional[str] = None
+    result: Optional[any] = None
+    error: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    completed_at: Optional[str] = None
+    metadata: Dict = field(default_factory=dict)
+
+
+class DelegationManager:
+    """
+    Manages task delegation and tracking
+    Allows orchestrators to delegate tasks to workers
+    """
+    
+    def __init__(self, transport: 'TransportLayer'):
+        self.transport = transport
+        self.tasks: Dict[str, Task] = {}
+        self.callbacks: Dict[str, Callable] = {}
+    
+    async def delegate_task(
+        self,
+        from_agent: str,
+        to_agent: str,
+        task_description: str,
+        callback: Optional[Callable] = None,
+        **metadata
+    ) -> str:
+        """Delegate a task to another agent"""
+        task_id = str(uuid.uuid4())
+        
+        task = Task(
+            task_id=task_id,
+            description=task_description,
+            assigned_to=to_agent,
+            created_by=from_agent,
+            status=TaskStatus.ASSIGNED,
+            metadata=metadata
+        )
+        
+        self.tasks[task_id] = task
+        
+        if callback:
+            self.callbacks[task_id] = callback
+        
+        # Send task via transport
+        await self.transport.send_message(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            message_type="task_delegation",
+            payload={
+                "task_id": task_id,
+                "description": task_description,
+                "metadata": metadata
+            }
+        )
+        
+        return task_id
+    
+    async def update_task_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        result: Optional[any] = None,
+        error: Optional[str] = None
+    ):
+        """Update task status"""
+        if task_id not in self.tasks:
+            return
+        
+        task = self.tasks[task_id]
+        task.status = status
+        
+        if result is not None:
+            task.result = result
+        
+        if error is not None:
+            task.error = error
+        
+        if status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]:
+            task.completed_at = datetime.now().isoformat()
+            
+            # Call callback if registered
+            if task_id in self.callbacks:
+                await self.callbacks[task_id](task)
+                del self.callbacks[task_id]
+    
+    def get_task(self, task_id: str) -> Optional[Task]:
+        """Get task by ID"""
+        return self.tasks.get(task_id)
+    
+    def get_agent_tasks(
+        self,
+        agent: str,
+        status: Optional[TaskStatus] = None
+    ) -> List[Task]:
+        """Get tasks for an agent"""
+        tasks = [
+            t for t in self.tasks.values()
+            if t.assigned_to == agent or t.created_by == agent
+        ]
+        
+        if status:
+            tasks = [t for t in tasks if t.status == status]
+        
+        return tasks
+    
+    def get_pending_tasks(self, agent: str) -> List[Task]:
+        """Get pending tasks for an agent"""
+        return self.get_agent_tasks(agent, TaskStatus.PENDING)
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/collaborative_memory.py
+# Shared memory for multi-agent collaboration
+# ============================================================================
+
+
+class CollaborativeMemory:
+    """
+    Shared memory space for agent collaboration
+    Allows agents to share context and information
+    """
+    
+    def __init__(self):
+        self.shared_context: Dict[str, any] = {}
+        self.agent_memories: Dict[str, Dict] = {}
+        self.facts: List[str] = []
+        self.decisions: List[Dict] = []
+    
+    def set_shared_context(self, key: str, value: any):
+        """Set shared context available to all agents"""
+        self.shared_context[key] = value
+    
+    def get_shared_context(self, key: str) -> Optional[any]:
+        """Get shared context"""
+        return self.shared_context.get(key)
+    
+    def add_agent_memory(self, agent: str, key: str, value: any):
+        """Add memory for specific agent"""
+        if agent not in self.agent_memories:
+            self.agent_memories[agent] = {}
+        self.agent_memories[agent][key] = value
+    
+    def get_agent_memory(self, agent: str, key: str) -> Optional[any]:
+        """Get agent-specific memory"""
+        if agent in self.agent_memories:
+            return self.agent_memories[agent].get(key)
+        return None
+    
+    def add_fact(self, fact: str, source: str = None):
+        """Add a fact to shared knowledge"""
+        self.facts.append({
+            "fact": fact,
+            "source": source,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    def record_decision(self, decision: str, decided_by: str, reasoning: str = ""):
+        """Record a collaborative decision"""
+        self.decisions.append({
+            "decision": decision,
+            "decided_by": decided_by,
+            "reasoning": reasoning,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    def get_context_summary(self) -> str:
+        """Get summary of collaborative context"""
+        summary = "**Shared Context:**\n"
+        for key, value in self.shared_context.items():
+            summary += f"- {key}: {value}\n"
+        
+        summary += "\n**Recent Facts:**\n"
+        for fact in self.facts[-5:]:
+            summary += f"- {fact['fact']} (from {fact['source']})\n"
+        
+        summary += "\n**Recent Decisions:**\n"
+        for decision in self.decisions[-3:]:
+            summary += f"- {decision['decision']} (by {decision['decided_by']})\n"
+        
+        return summary
+
+
+# ============================================================================
+# FILE: tests/test_a2a.py
+# Comprehensive tests for A2A system
+# ============================================================================
+import pytest
+import asyncio
+from nexus.nexus_base.a2a.agent_card import AgentCard, AgentCapability
+from nexus.nexus_base.a2a.transport_layer import (
+    TransportLayer, DirectTransport, A2AMessage
+)
+from nexus.nexus_base.a2a.agent_executor import AgentExecutor
+from nexus.nexus_base.a2a.agent_registry import AgentRegistry
+from nexus.nexus_base.a2a.conversation_manager import ConversationManager
+
+
+class MockAgent:
+    """Mock agent for testing"""
+    def __init__(self, name):
+        self.name = name
+        self.supports_actions = True
+        self.supports_knowledge = False
+        self.supports_memory = False
+    
+    async def get_response(self, input_text):
+        await asyncio.sleep(0.1)  # Simulate processing
+        return f"{self.name} processed: {input_text}"
+
+
+class TestAgentCard:
+    """Test AgentCard functionality"""
+    
+    def test_create_agent_card(self):
+        card = AgentCard(
+            name="test_agent",
+            display_name="Test Agent",
+            agent_type="worker"
+        )
+        
+        assert card.name == "test_agent"
+        assert card.agent_type == "worker"
+        assert card.status == "offline"
+    
+    def test_agent_card_from_dict(self):
+        data = {
+            "name": "test_agent",
+            "agent_type": "worker",
+            "capabilities": []
+        }
+        
+        card = AgentCard.from_dict(data)
+        assert card.name == "test_agent"
+    
+    def test_add_capability(self):
+        card = AgentCard(name="test_agent")
+        
+        cap = AgentCapability(
+            name="search",
+            description="Search capability",
+            input_schema={"type": "string"},
+            output_schema={"type": "string"}
+        )
+        
+        card.capabilities.append(cap)
+        assert len(card.capabilities) == 1
+        assert card.capabilities[0].name == "search"
+
+
+class TestTransportLayer:
+    """Test TransportLayer functionality"""
+    
+    @pytest.fixture
+    def transport(self):
+        return TransportLayer()
+    
+    def test_register_agent(self, transport):
+        transport.register_agent("agent1")
+        assert "agent1" in transport.protocols['direct'].queues
+    
+    @pytest.mark.asyncio
+    async def test_send_receive_message(self, transport):
+        transport.register_agent("agent1")
+        transport.register_agent("agent2")
+        
+        msg_id = await transport.send_message(
+            from_agent="agent1",
+            to_agent="agent2",
+            message_type="request",
+            payload="Hello"
+        )
+        
+        assert msg_id is not None
+        
+        received = await transport.receive_message("agent2")
+        assert received is not None
+        assert received.from_agent == "agent1"
+        assert received.payload == "Hello"
+    
+    @pytest.mark.asyncio
+    async def test_broadcast(self, transport):
+        transport.register_agent("agent1")
+        transport.register_agent("agent2")
+        transport.register_agent("agent3")
+        
+        await transport.send_message(
+            from_agent="agent1",
+            to_agent="broadcast",
+            message_type="broadcast",
+            payload="Broadcast message"
+        )
+        
+        # agent2 and agent3 should receive
+        msg2 = await transport.receive_message("agent2")
+        msg3 = await transport.receive_message("agent3")
+        
+        assert msg2.payload == "Broadcast message"
+        assert msg3.payload == "Broadcast message"
+
+
+class TestAgentExecutor:
+    """Test AgentExecutor functionality"""
+    
+    @pytest.fixture
+    def setup(self):
+        transport = TransportLayer()
+        agent = MockAgent("test_agent")
+        card = AgentCard(name="test_agent")
+        executor = AgentExecutor(agent, card, transport)
+        return executor, transport
+    
+    @pytest.mark.asyncio
+    async def test_execute_task(self, setup):
+        executor, _ = setup
+        
+        result = await executor.execute_task("test task")
+        assert "test_agent processed" in result
+    
+    @pytest.mark.asyncio
+    async def test_send_to_agent(self, setup):
+        executor, transport = setup
+        transport.register_agent("target_agent")
+        
+        msg_id = await executor.send_to_agent(
+            to_agent="target_agent",
+            message_type="request",
+            payload="task"
+        )
+        
+        assert msg_id is not None
+
+
+class TestAgentRegistry:
+    """Test AgentRegistry functionality"""
+    
+    @pytest.fixture
+    def registry(self):
+        return AgentRegistry()
+    
+    def test_register_agent(self, registry):
+        card = AgentCard(name="test_agent")
+        success = registry.register(card)
+        
+        assert success
+        assert card.agent_id in registry.agents
+        assert card.status == "online"
+    
+    def test_discover_by_capability(self, registry):
+        card1 = AgentCard(name="agent1", actions=["search"])
+        card2 = AgentCard(name="agent2", actions=["analyze"])
+        
+        registry.register(card1)
+        registry.register(card2)
+        
+        results = registry.list_agents()
+        assert len(results) == 2
+    
+    def test_get_orchestrators(self, registry):
+        card1 = AgentCard(name="worker", agent_type="worker")
+        card2 = AgentCard(name="orchestrator", agent_type="orchestrator")
+        
+        registry.register(card1)
+        registry.register(card2)
+        
+        orchestrators = registry.get_orchestrators()
+        assert len(orchestrators) == 1
+        assert orchestrators[0].name == "orchestrator"
+
+
+class TestConversationManager:
+    """Test ConversationManager functionality"""
+    
+    @pytest.fixture
+    def conv_manager(self):
+        return ConversationManager()
+    
+    def test_create_conversation(self, conv_manager):
+        conv = conv_manager.create_conversation("test topic")
+        
+        assert conv.topic == "test topic"
+        assert conv.conversation_id in conv_manager.conversations
+    
+    def test_add_turns(self, conv_manager):
+        conv = conv_manager.create_conversation()
+        
+        conv.add_turn("agent1", "Hello")
+        conv.add_turn("agent2", "Hi there")
+        
+        assert len(conv.turns) == 2
+        assert len(conv.participants) == 2
+    
+    def test_get_context(self, conv_manager):
+        conv = conv_manager.create_conversation("test")
+        conv.add_turn("agent1", "First message")
+        conv.add_turn("agent2", "Second message")
+        
+        context = conv.get_context()
+        assert "agent1: First message" in context
+        assert "agent2: Second message" in context
+
+
+# Run tests
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+# ============================================================================
+# FILE: examples/a2a_quickstart.py
+# Quick start example for A2A
+# ============================================================================
+import asyncio
+from nexus.nexus_base.nexus import Nexus
+
+
+async def quickstart_example():
+    """Quick start example for A2A orchestration"""
+    
+    print("=== Nexus A2A Quick Start ===\n")
+    
+    # 1. Initialize Nexus
+    print("1. Initializing Nexus...")
+    nexus = Nexus()
+    
+    # 2. Start A2A server
+    print("2. Starting A2A server...")
+    await nexus.start_a2a_server()
+    
+    # 3. Load orchestration
+    print("3. Loading orchestration...")
+    try:
+        orch = nexus.load_a2a_orchestration("research_team")
+        print(f"   Loaded: {orch.config.name}")
+        print(f"   Agents: {', '.join(orch.get_agents())}")
+    except FileNotFoundError:
+        print("   Error: research_team.yaml not found")
+        print("   Please create the configuration file first")
+        return
+    
+    # 4. Execute workflow
+    print("\n4. Executing workflow...")
+    results = await nexus.a2a_manager.execute_workflow(
+        "research_team",
+        "research_and_report",
+        "Artificial Intelligence trends in 2024"
+    )
+    
+    print("\n5. Results:")
+    for agent, result in results.items():
+        print(f"\n   {agent}:")
+        print(f"   {result}")
+    
+    # 6. Interactive mode
+    print("\n6. Interactive mode:")
+    response = await nexus.a2a_manager.chat_with_orchestration(
+        "research_team",
+        "What are the key findings?"
+    )
+    print(f"   Orchestrator: {response}")
+    
+    # 7. Check network status
+    print("\n7. Network Status:")
+    status = nexus.get_a2a_network_status()
+    print(f"   Total Agents: {status['total_agents']}")
+    print(f"   Online Agents: {status['online_agents']}")
+    print(f"   Total Messages: {status['message_count']}")
+    
+    print("\n=== Complete ===")
+
+
+if __name__ == "__main__":
+    asyncio.run(quickstart_example())
+
+
+# ============================================================================
+# FILE: examples/a2a_custom_orchestration.py
+# Example of creating custom orchestration
+# ============================================================================
+import asyncio
+from pathlib import Path
+import yaml
+
+
+def create_custom_orchestration():
+    """Create a custom orchestration configuration"""
+    
+    config = {
+        "orchestration": {
+            "name": "code_review_team",
+            "description": "Automated code review with multiple agents",
+            "orchestrator": "lead_reviewer",
+            "agents": [
+                {
+                    "name": "lead_reviewer",
+                    "role": "orchestrator",
+                    "profile": "adam"
+                },
+                {
+                    "name": "security_reviewer",
+                    "role": "worker",
+                    "profile": "adam"
+                },
+                {
+                    "name": "performance_reviewer",
+                    "role": "worker",
+                    "profile": "adam"
+                },
+                {
+                    "name": "style_reviewer",
+                    "role": "worker",
+                    "profile": "adam"
+                }
+            ],
+            "communication_patterns": [
+                {
+                    "from": "lead_reviewer",
+                    "to": ["security_reviewer", "performance_reviewer", "style_reviewer"],
+                    "mode": "parallel"
+                },
+                {
+                    "from": "security_reviewer",
+                    "to": ["lead_reviewer"],
+                    "mode": "response"
+                },
+                {
+                    "from": "performance_reviewer",
+                    "to": ["lead_reviewer"],
+                    "mode": "response"
+                },
+                {
+                    "from": "style_reviewer",
+                    "to": ["lead_reviewer"],
+                    "mode": "response"
+                }
+            ],
+            "workflows": [
+                {
+                    "name": "review_code",
+                    "description": "Comprehensive code review",
+                    "steps": [
+                        {
+                            "agent": "lead_reviewer",
+                            "action": "analyze_code",
+                            "output_to": ["security_reviewer", "performance_reviewer", "style_reviewer"]
+                        },
+                        {
+                            "agent": "security_reviewer",
+                            "action": "check_security",
+                            "output_to": ["lead_reviewer"]
+                        },
+                        {
+                            "agent": "performance_reviewer",
+                            "action": "check_performance",
+                            "output_to": ["lead_reviewer"]
+                        },
+                        {
+                            "agent": "style_reviewer",
+                            "action": "check_style",
+                            "output_to": ["lead_reviewer"]
+                        },
+                        {
+                            "agent": "lead_reviewer",
+                            "action": "compile_review"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    
+    # Save to file
+    config_path = Path("nexus/nexus_base/a2a_configs/code_review_team.yaml")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    print(f"Created custom orchestration: {config_path}")
+    return config_path
+
+
+async def test_custom_orchestration():
+    """Test the custom orchestration"""
+    from nexus.nexus_base.nexus import Nexus
+    
+    # Create config
+    create_custom_orchestration()
+    
+    # Initialize and test
+    nexus = Nexus()
+    await nexus.start_a2a_server()
+    
+    orch = nexus.load_a2a_orchestration("code_review_team")
+    
+    code_sample = """
+def calculate_total(items):
+    total = 0
+    for item in items:
+        total = total + item
+    return total
+    """
+    
+    results = await nexus.a2a_manager.execute_workflow(
+        "code_review_team",
+        "review_code",
+        f"Review this code:\n{code_sample}"
+    )
+    
+    print("\n=== Code Review Results ===")
+    for agent, result in results.items():
+        print(f"\n{agent}:")
+        print(result)
+
+
+if __name__ == "__main__":
+    asyncio.run(test_custom_orchestration())
