@@ -1,0 +1,1004 @@
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/agent_card.py
+# Agent Card - Metadata and capabilities description for agents
+# ============================================================================
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Any
+from datetime import datetime
+import json
+import uuid
+
+
+@dataclass
+class AgentCapability:
+    """Represents a single capability of an agent"""
+    name: str
+    description: str
+    input_schema: Dict[str, Any]
+    output_schema: Dict[str, Any]
+    category: str = "general"  # general, specialized, orchestration
+
+
+@dataclass
+class AgentCard:
+    """
+    Agent Card - Contains all metadata and capabilities of an agent
+    Similar to a business card for agents
+    """
+    # Identity
+    agent_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    display_name: str = ""
+    avatar: str = "🤖"
+    
+    # Classification
+    agent_type: str = "worker"  # worker, orchestrator, specialist
+    role: str = "assistant"
+    
+    # Capabilities
+    capabilities: List[AgentCapability] = field(default_factory=list)
+    actions: List[str] = field(default_factory=list)
+    supports_actions: bool = False
+    supports_knowledge: bool = False
+    supports_memory: bool = False
+    
+    # Profile
+    persona: str = ""
+    profile_name: Optional[str] = None
+    
+    # Communication
+    endpoint: Optional[str] = None  # URL or identifier for communication
+    protocols: List[str] = field(default_factory=lambda: ["direct", "queue"])
+    
+    # Status
+    status: str = "offline"  # offline, online, busy, error
+    last_heartbeat: Optional[str] = None
+    
+    # Metadata
+    version: str = "1.0.0"
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
+        result = asdict(self)
+        return result
+    
+    def to_json(self) -> str:
+        """Convert to JSON string"""
+        return json.dumps(self.to_dict(), indent=2)
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'AgentCard':
+        """Create AgentCard from dictionary"""
+        # Handle nested capabilities
+        if 'capabilities' in data:
+            data['capabilities'] = [
+                AgentCapability(**cap) if isinstance(cap, dict) else cap
+                for cap in data['capabilities']
+            ]
+        return cls(**data)
+    
+    @classmethod
+    def from_agent(cls, agent, profile=None) -> 'AgentCard':
+        """Create AgentCard from existing Nexus agent"""
+        card = cls(
+            name=agent.name,
+            display_name=agent.name,
+            agent_type="worker",
+            supports_actions=agent.supports_actions,
+            supports_knowledge=agent.supports_knowledge,
+            supports_memory=agent.supports_memory,
+        )
+        
+        if profile:
+            card.persona = profile.persona
+            card.profile_name = profile.name
+            card.avatar = profile.avatar
+            card.actions = profile.actions or []
+            
+            # Convert profile actions to capabilities
+            for action in (profile.actions or []):
+                cap = AgentCapability(
+                    name=action,
+                    description=f"Action: {action}",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "string"},
+                    category="action"
+                )
+                card.capabilities.append(cap)
+        
+        return card
+    
+    def update_status(self, status: str):
+        """Update agent status"""
+        self.status = status
+        self.last_heartbeat = datetime.now().isoformat()
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/transport_layer.py
+# Transport Layer - Handles message routing and delivery
+# ============================================================================
+import asyncio
+from abc import ABC, abstractmethod
+from typing import Optional, Callable, Dict, Any
+from dataclasses import dataclass
+from queue import Queue, Empty
+from datetime import datetime
+import json
+
+
+@dataclass
+class A2AMessage:
+    """Standard message format for A2A communication"""
+    message_id: str
+    from_agent: str
+    to_agent: str
+    message_type: str  # request, response, broadcast, notification
+    payload: Any
+    conversation_id: Optional[str] = None
+    reply_to: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict:
+        return {
+            'message_id': self.message_id,
+            'from_agent': self.from_agent,
+            'to_agent': self.to_agent,
+            'message_type': self.message_type,
+            'payload': self.payload,
+            'conversation_id': self.conversation_id,
+            'reply_to': self.reply_to,
+            'timestamp': self.timestamp,
+            'metadata': self.metadata
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'A2AMessage':
+        return cls(**data)
+
+
+class TransportProtocol(ABC):
+    """Abstract base for transport protocols"""
+    
+    @abstractmethod
+    async def send(self, message: A2AMessage) -> bool:
+        """Send a message"""
+        pass
+    
+    @abstractmethod
+    async def receive(self, agent_id: str, timeout: Optional[float] = None) -> Optional[A2AMessage]:
+        """Receive a message"""
+        pass
+    
+    @abstractmethod
+    def register_handler(self, agent_id: str, handler: Callable):
+        """Register message handler for an agent"""
+        pass
+
+
+class DirectTransport(TransportProtocol):
+    """Direct in-memory transport for local agents"""
+    
+    def __init__(self):
+        self.queues: Dict[str, Queue] = {}
+        self.handlers: Dict[str, Callable] = {}
+        
+    def register_agent(self, agent_id: str):
+        """Register an agent with a message queue"""
+        if agent_id not in self.queues:
+            self.queues[agent_id] = Queue()
+    
+    async def send(self, message: A2AMessage) -> bool:
+        """Send message to agent's queue"""
+        if message.to_agent == "broadcast":
+            # Broadcast to all agents
+            for agent_id in self.queues:
+                if agent_id != message.from_agent:
+                    self.queues[agent_id].put(message)
+            return True
+        
+        if message.to_agent not in self.queues:
+            print(f"Agent {message.to_agent} not registered")
+            return False
+        
+        self.queues[message.to_agent].put(message)
+        
+        # Call handler if registered
+        if message.to_agent in self.handlers:
+            asyncio.create_task(self.handlers[message.to_agent](message))
+        
+        return True
+    
+    async def receive(self, agent_id: str, timeout: Optional[float] = None) -> Optional[A2AMessage]:
+        """Receive message from agent's queue"""
+        if agent_id not in self.queues:
+            return None
+        
+        try:
+            return self.queues[agent_id].get(timeout=timeout)
+        except Empty:
+            return None
+    
+    def register_handler(self, agent_id: str, handler: Callable):
+        """Register async message handler"""
+        self.handlers[agent_id] = handler
+    
+    def get_queue_size(self, agent_id: str) -> int:
+        """Get number of pending messages"""
+        if agent_id in self.queues:
+            return self.queues[agent_id].qsize()
+        return 0
+
+
+class HTTPTransport(TransportProtocol):
+    """HTTP-based transport for distributed agents"""
+    
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        self.base_url = base_url
+        self.session = None  # Would use aiohttp in production
+        
+    async def send(self, message: A2AMessage) -> bool:
+        """Send message via HTTP POST"""
+        # In production, use aiohttp
+        # async with self.session.post(
+        #     f"{self.base_url}/agents/{message.to_agent}/messages",
+        #     json=message.to_dict()
+        # ) as response:
+        #     return response.status == 200
+        return True
+    
+    async def receive(self, agent_id: str, timeout: Optional[float] = None) -> Optional[A2AMessage]:
+        """Poll for messages via HTTP GET"""
+        # In production, use long-polling or WebSocket
+        return None
+    
+    def register_handler(self, agent_id: str, handler: Callable):
+        """Register webhook handler"""
+        pass
+
+
+class TransportLayer:
+    """Main transport layer that manages multiple protocols"""
+    
+    def __init__(self):
+        self.protocols: Dict[str, TransportProtocol] = {
+            'direct': DirectTransport(),
+        }
+        self.default_protocol = 'direct'
+        self.message_log: List[A2AMessage] = []
+        
+    def add_protocol(self, name: str, protocol: TransportProtocol):
+        """Add a new transport protocol"""
+        self.protocols[name] = protocol
+    
+    def register_agent(self, agent_id: str, protocol: str = None):
+        """Register agent with transport layer"""
+        protocol = protocol or self.default_protocol
+        if protocol in self.protocols:
+            if hasattr(self.protocols[protocol], 'register_agent'):
+                self.protocols[protocol].register_agent(agent_id)
+    
+    async def send_message(
+        self,
+        from_agent: str,
+        to_agent: str,
+        message_type: str,
+        payload: Any,
+        protocol: str = None,
+        **kwargs
+    ) -> str:
+        """Send a message using specified protocol"""
+        protocol = protocol or self.default_protocol
+        
+        message = A2AMessage(
+            message_id=str(uuid.uuid4()),
+            from_agent=from_agent,
+            to_agent=to_agent,
+            message_type=message_type,
+            payload=payload,
+            **kwargs
+        )
+        
+        self.message_log.append(message)
+        
+        if protocol in self.protocols:
+            await self.protocols[protocol].send(message)
+            return message.message_id
+        else:
+            raise ValueError(f"Protocol {protocol} not available")
+    
+    async def receive_message(
+        self,
+        agent_id: str,
+        protocol: str = None,
+        timeout: Optional[float] = None
+    ) -> Optional[A2AMessage]:
+        """Receive a message"""
+        protocol = protocol or self.default_protocol
+        
+        if protocol in self.protocols:
+            return await self.protocols[protocol].receive(agent_id, timeout)
+        return None
+    
+    def register_handler(self, agent_id: str, handler: Callable, protocol: str = None):
+        """Register message handler"""
+        protocol = protocol or self.default_protocol
+        if protocol in self.protocols:
+            self.protocols[protocol].register_handler(agent_id, handler)
+    
+    def get_message_history(self, limit: int = 100) -> List[A2AMessage]:
+        """Get recent message history"""
+        return self.message_log[-limit:]
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/agent_executor.py
+# Agent Executor - Executes agent tasks and manages lifecycle
+# ============================================================================
+from typing import Any, Dict, Optional
+import asyncio
+
+
+class AgentExecutor:
+    """
+    Executes agent tasks and manages agent lifecycle
+    Wraps existing Nexus agents with A2A capabilities
+    """
+    
+    def __init__(self, agent, agent_card: AgentCard, transport: TransportLayer):
+        self.agent = agent
+        self.agent_card = agent_card
+        self.transport = transport
+        self.is_running = False
+        self.execution_log: List[Dict] = []
+        
+        # Register with transport layer
+        self.transport.register_agent(self.agent_card.agent_id)
+        self.transport.register_handler(
+            self.agent_card.agent_id,
+            self.handle_message
+        )
+    
+    async def handle_message(self, message: A2AMessage):
+        """Handle incoming A2A message"""
+        self._log(f"Received {message.message_type} from {message.from_agent}")
+        
+        try:
+            if message.message_type == "request":
+                response = await self.execute_task(message.payload, message.metadata)
+                
+                # Send response back
+                await self.transport.send_message(
+                    from_agent=self.agent_card.agent_id,
+                    to_agent=message.from_agent,
+                    message_type="response",
+                    payload=response,
+                    reply_to=message.message_id,
+                    conversation_id=message.conversation_id
+                )
+            
+            elif message.message_type == "broadcast":
+                # Handle broadcast messages
+                self._log(f"Received broadcast: {message.payload}")
+            
+            elif message.message_type == "response":
+                # Handle responses (might be waiting for this)
+                self._log(f"Received response: {message.payload}")
+        
+        except Exception as e:
+            self._log(f"Error handling message: {e}", level="error")
+            
+            # Send error response
+            await self.transport.send_message(
+                from_agent=self.agent_card.agent_id,
+                to_agent=message.from_agent,
+                message_type="error",
+                payload={"error": str(e)},
+                reply_to=message.message_id
+            )
+    
+    async def execute_task(self, task: Any, context: Dict = None) -> Any:
+        """Execute a task using the wrapped agent"""
+        self._log(f"Executing task: {task}")
+        
+        try:
+            # Check if agent has async get_response
+            if hasattr(self.agent, 'get_response') and asyncio.iscoroutinefunction(self.agent.get_response):
+                result = await self.agent.get_response(task)
+            elif hasattr(self.agent, 'get_response'):
+                result = self.agent.get_response(task)
+            else:
+                # Fallback: treat task as simple string input
+                result = f"{self.agent.name} processed: {task}"
+            
+            self._log(f"Task completed: {result}")
+            return result
+        
+        except Exception as e:
+            self._log(f"Task execution error: {e}", level="error")
+            raise
+    
+    async def send_to_agent(
+        self,
+        to_agent: str,
+        message_type: str,
+        payload: Any,
+        conversation_id: Optional[str] = None
+    ) -> str:
+        """Send message to another agent"""
+        return await self.transport.send_message(
+            from_agent=self.agent_card.agent_id,
+            to_agent=to_agent,
+            message_type=message_type,
+            payload=payload,
+            conversation_id=conversation_id
+        )
+    
+    async def broadcast(self, payload: Any):
+        """Broadcast message to all agents"""
+        return await self.transport.send_message(
+            from_agent=self.agent_card.agent_id,
+            to_agent="broadcast",
+            message_type="broadcast",
+            payload=payload
+        )
+    
+    def _log(self, message: str, level: str = "info"):
+        """Log execution event"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'agent': self.agent_card.name,
+            'level': level,
+            'message': message
+        }
+        self.execution_log.append(log_entry)
+        print(f"[{log_entry['timestamp']}] [{self.agent_card.name}] {message}")
+    
+    def get_status(self) -> Dict:
+        """Get executor status"""
+        return {
+            'agent_id': self.agent_card.agent_id,
+            'name': self.agent_card.name,
+            'status': self.agent_card.status,
+            'is_running': self.is_running,
+            'pending_messages': self.transport.protocols['direct'].get_queue_size(
+                self.agent_card.agent_id
+            ) if 'direct' in self.transport.protocols else 0
+        }
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/agent_registry.py
+# Agent Registry - Service discovery for agents
+# ============================================================================
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+
+
+class AgentRegistry:
+    """
+    Central registry for agent discovery and lookup
+    Maintains a directory of all available agents
+    """
+    
+    def __init__(self, heartbeat_timeout: int = 60):
+        self.agents: Dict[str, AgentCard] = {}
+        self.heartbeat_timeout = heartbeat_timeout  # seconds
+        
+    def register(self, agent_card: AgentCard) -> bool:
+        """Register a new agent"""
+        agent_card.update_status("online")
+        self.agents[agent_card.agent_id] = agent_card
+        print(f"Registered agent: {agent_card.name} ({agent_card.agent_id})")
+        return True
+    
+    def unregister(self, agent_id: str) -> bool:
+        """Unregister an agent"""
+        if agent_id in self.agents:
+            agent = self.agents[agent_id]
+            agent.update_status("offline")
+            del self.agents[agent_id]
+            print(f"Unregistered agent: {agent.name}")
+            return True
+        return False
+    
+    def update_heartbeat(self, agent_id: str):
+        """Update agent heartbeat"""
+        if agent_id in self.agents:
+            self.agents[agent_id].update_status(self.agents[agent_id].status)
+    
+    def get_agent(self, agent_id: str) -> Optional[AgentCard]:
+        """Get agent by ID"""
+        return self.agents.get(agent_id)
+    
+    def get_agent_by_name(self, name: str) -> Optional[AgentCard]:
+        """Get agent by name"""
+        for agent in self.agents.values():
+            if agent.name == name:
+                return agent
+        return None
+    
+    def list_agents(
+        self,
+        agent_type: Optional[str] = None,
+        status: Optional[str] = None,
+        capability: Optional[str] = None
+    ) -> List[AgentCard]:
+        """List agents with optional filters"""
+        agents = list(self.agents.values())
+        
+        if agent_type:
+            agents = [a for a in agents if a.agent_type == agent_type]
+        
+        if status:
+            agents = [a for a in agents if a.status == status]
+        
+        if capability:
+            agents = [a for a in agents if capability in a.actions]
+        
+        return agents
+    
+    def discover_by_capability(self, capability: str) -> List[AgentCard]:
+        """Find agents with specific capability"""
+        return [
+            agent for agent in self.agents.values()
+            if any(cap.name == capability for cap in agent.capabilities)
+        ]
+    
+    def get_orchestrators(self) -> List[AgentCard]:
+        """Get all orchestrator agents"""
+        return self.list_agents(agent_type="orchestrator", status="online")
+    
+    def cleanup_stale_agents(self):
+        """Remove agents that haven't sent heartbeat"""
+        cutoff = datetime.now() - timedelta(seconds=self.heartbeat_timeout)
+        stale = []
+        
+        for agent_id, agent in self.agents.items():
+            if agent.last_heartbeat:
+                last_hb = datetime.fromisoformat(agent.last_heartbeat)
+                if last_hb < cutoff:
+                    stale.append(agent_id)
+        
+        for agent_id in stale:
+            self.unregister(agent_id)
+    
+    def get_network_graph(self) -> Dict:
+        """Get network graph of agents"""
+        return {
+            'nodes': [
+                {
+                    'id': agent.agent_id,
+                    'name': agent.name,
+                    'type': agent.agent_type,
+                    'status': agent.status
+                }
+                for agent in self.agents.values()
+            ],
+            'total': len(self.agents)
+        }
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/orchestration_config.py
+# Orchestration Configuration - Load and manage A2A configs
+# ============================================================================
+import yaml
+from pathlib import Path
+from typing import Dict, List
+
+
+class OrchestrationConfig:
+    """Loads and manages orchestration configurations from YAML"""
+    
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.config = self._load_config()
+        
+    def _load_config(self) -> Dict:
+        """Load orchestration config from YAML"""
+        with open(self.config_path, 'r') as f:
+            return yaml.safe_load(f)
+    
+    @property
+    def name(self) -> str:
+        return self.config.get('orchestration', {}).get('name', '')
+    
+    @property
+    def description(self) -> str:
+        return self.config.get('orchestration', {}).get('description', '')
+    
+    @property
+    def orchestrator(self) -> str:
+        return self.config.get('orchestration', {}).get('orchestrator', '')
+    
+    @property
+    def agents(self) -> List[Dict]:
+        return self.config.get('orchestration', {}).get('agents', [])
+    
+    @property
+    def communication_patterns(self) -> List[Dict]:
+        return self.config.get('orchestration', {}).get('communication_patterns', [])
+    
+    @property
+    def workflows(self) -> List[Dict]:
+        return self.config.get('orchestration', {}).get('workflows', [])
+    
+    def get_workflow(self, name: str) -> Optional[Dict]:
+        """Get workflow by name"""
+        for workflow in self.workflows:
+            if workflow.get('name') == name:
+                return workflow
+        return None
+    
+    def get_agent_config(self, name: str) -> Optional[Dict]:
+        """Get agent configuration by name"""
+        for agent in self.agents:
+            if agent.get('name') == name:
+                return agent
+        return None
+    
+    def can_communicate(self, from_agent: str, to_agent: str) -> bool:
+        """Check if two agents can communicate"""
+        for pattern in self.communication_patterns:
+            if pattern.get('from') == from_agent:
+                if to_agent in pattern.get('to', []):
+                    return True
+        return False
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/a2a_server.py
+# A2A Server - Central coordination server
+# ============================================================================
+from typing import Dict, List, Optional
+import asyncio
+
+
+class A2AServer:
+    """
+    Central A2A coordination server
+    Manages agent lifecycle, discovery, and orchestration
+    """
+    
+    def __init__(self, nexus):
+        self.nexus = nexus  # Reference to Nexus instance
+        self.registry = AgentRegistry()
+        self.transport = TransportLayer()
+        self.executors: Dict[str, AgentExecutor] = {}
+        self.orchestrations: Dict[str, 'A2AOrchestrator'] = {}
+        self.is_running = False
+        
+    def initialize_agent(self, agent_name: str, profile_name: str = None) -> AgentExecutor:
+        """Initialize an agent with A2A capabilities"""
+        # Get agent from Nexus
+        agent = self.nexus.get_agent(agent_name)
+        
+        # Get profile if specified
+        profile = None
+        if profile_name:
+            profile = self.nexus.get_profile(profile_name)
+            agent.profile = profile
+        
+        # Create agent card
+        agent_card = AgentCard.from_agent(agent, profile)
+        
+        # Create executor
+        executor = AgentExecutor(agent, agent_card, self.transport)
+        
+        # Register
+        self.registry.register(agent_card)
+        self.executors[agent_card.agent_id] = executor
+        
+        return executor
+    
+    def load_orchestration(self, config_path: str) -> 'A2AOrchestrator':
+        """Load orchestration from YAML config"""
+        config = OrchestrationConfig(config_path)
+        orchestrator = A2AOrchestrator(config, self)
+        self.orchestrations[config.name] = orchestrator
+        return orchestrator
+    
+    def get_orchestration(self, name: str) -> Optional['A2AOrchestrator']:
+        """Get orchestration by name"""
+        return self.orchestrations.get(name)
+    
+    def list_orchestrations(self) -> List[str]:
+        """List all loaded orchestrations"""
+        return list(self.orchestrations.keys())
+    
+    def list_agents(self) -> List[AgentCard]:
+        """List all registered agents"""
+        return self.registry.list_agents()
+    
+    def discover_agents(self, **filters) -> List[AgentCard]:
+        """Discover agents by filters"""
+        return self.registry.list_agents(**filters)
+    
+    async def start(self):
+        """Start the A2A server"""
+        self.is_running = True
+        print("A2A Server started")
+        
+        # Start heartbeat monitor
+        asyncio.create_task(self._heartbeat_monitor())
+    
+    async def stop(self):
+        """Stop the A2A server"""
+        self.is_running = False
+        print("A2A Server stopped")
+    
+    async def _heartbeat_monitor(self):
+        """Monitor agent heartbeats"""
+        while self.is_running:
+            await asyncio.sleep(30)
+            self.registry.cleanup_stale_agents()
+    
+    def get_network_status(self) -> Dict:
+        """Get overall network status"""
+        return {
+            'total_agents': len(self.executors),
+            'online_agents': len(self.registry.list_agents(status="online")),
+            'orchestrations': len(self.orchestrations),
+            'message_count': len(self.transport.message_log),
+            'agents': [
+                executor.get_status()
+                for executor in self.executors.values()
+            ]
+        }
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a/a2a_orchestrator.py
+# A2A Orchestrator - Manages multi-agent workflows
+# ============================================================================
+
+
+class A2AOrchestrator:
+    """
+    Orchestrates multi-agent workflows
+    Coordinates agent interactions based on configuration
+    """
+    
+    def __init__(self, config: OrchestrationConfig, server: A2AServer):
+        self.config = config
+        self.server = server
+        self.orchestrator_executor: Optional[AgentExecutor] = None
+        self.agent_executors: Dict[str, AgentExecutor] = {}
+        self.execution_log: List[Dict] = []
+        self._initialize()
+    
+    def _initialize(self):
+        """Initialize all agents in the orchestration"""
+        for agent_config in self.config.agents:
+            agent_name = agent_config['name']
+            profile_path = agent_config.get('profile', '').replace('profiles/', '').replace('.yaml', '')
+            
+            try:
+                executor = self.server.initialize_agent(agent_name, profile_path)
+                executor.agent_card.agent_type = agent_config['role']
+                
+                self.agent_executors[agent_name] = executor
+                
+                if agent_config['role'] == 'orchestrator':
+                    self.orchestrator_executor = executor
+                
+                self._log(f"Initialized {agent_name} as {agent_config['role']}")
+            
+            except Exception as e:
+                self._log(f"Error initializing {agent_name}: {e}", level="error")
+    
+    async def execute_workflow(self, workflow_name: str, initial_input: str) -> Dict:
+        """Execute a defined workflow"""
+        workflow = self.config.get_workflow(workflow_name)
+        if not workflow:
+            raise ValueError(f"Workflow {workflow_name} not found")
+        
+        self._log(f"Starting workflow: {workflow_name}")
+        results = {}
+        conversation_id = str(uuid.uuid4())
+        
+        for step in workflow['steps']:
+            agent_name = step['agent']
+            action = step.get('action', 'process')
+            
+            if agent_name not in self.agent_executors:
+                self._log(f"Agent {agent_name} not found", level="error")
+                continue
+            
+            executor = self.agent_executors[agent_name]
+            
+            # Prepare input
+            if step == workflow['steps'][0]:
+                step_input = initial_input
+            else:
+                # Use output from previous steps
+                step_input = results.get(agent_name, initial_input)
+            
+            self._log(f"{agent_name} executing {action}")
+            
+            # Execute via message
+            task = {
+                'action': action,
+                'input': step_input,
+                'workflow': workflow_name
+            }
+            
+            result = await executor.execute_task(task, {'step': step})
+            results[agent_name] = result
+            
+            # Send to next agents if specified
+            if 'output_to' in step:
+                for next_agent in step['output_to']:
+                    if next_agent in self.agent_executors:
+                        await executor.send_to_agent(
+                            to_agent=self.agent_executors[next_agent].agent_card.agent_id,
+                            message_type="request",
+                            payload=result,
+                            conversation_id=conversation_id
+                        )
+        
+        self._log(f"Workflow {workflow_name} completed")
+        return results
+    
+    async def run_interactive(self, user_input: str) -> str:
+        """Run in interactive mode with orchestrator handling input"""
+        if not self.orchestrator_executor:
+            raise ValueError("No orchestrator agent defined")
+        
+        self._log(f"User: {user_input}")
+        
+        conversation_id = str(uuid.uuid4())
+        result = await self.orchestrator_executor.execute_task(
+            user_input,
+            {'conversation_id': conversation_id}
+        )
+        
+        self._log(f"Orchestrator: {result}")
+        return result
+    
+    def _log(self, message: str, level: str = "info"):
+        """Log orchestration event"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'orchestration': self.config.name,
+            'level': level,
+            'message': message
+        }
+        self.execution_log.append(log_entry)
+        print(f"[{log_entry['timestamp']}] [{self.config.name}] {message}")
+    
+    def get_agents(self) -> List[str]:
+        """Get list of agent names"""
+        return list(self.agent_executors.keys())
+    
+    def get_status(self) -> Dict:
+        """Get orchestration status"""
+        return {
+            'name': self.config.name,
+            'description': self.config.description,
+            'orchestrator': self.config.orchestrator,
+            'agents': [
+                {
+                    'name': name,
+                    'status': executor.agent_card.status,
+                    'type': executor.agent_card.agent_type
+                }
+                for name, executor in self.agent_executors.items()
+            ],
+            'workflows': [w['name'] for w in self.config.workflows]
+        }
+
+
+# ============================================================================
+# FILE: nexus/nexus_base/a2a_manager.py
+# A2A Manager - Integration with Nexus
+# ============================================================================
+
+
+class A2AManager:
+    """
+    Manages A2A functionality within Nexus
+    Provides high-level interface for A2A operations
+    """
+    
+    def __init__(self, nexus):
+        self.nexus = nexus
+        self.server = A2AServer(nexus)
+        self.config_directory = Path(__file__).parent / "a2a_configs"
+        self.config_directory.mkdir(exist_ok=True)
+    
+    async def start_server(self):
+        """Start A2A server"""
+        await self.server.start()
+    
+    async def stop_server(self):
+        """Stop A2A server"""
+        await self.server.stop()
+    
+    def load_orchestration(self, config_name: str) -> A2AOrchestrator:
+        """Load orchestration configuration"""
+        config_path = self.config_directory / f"{config_name}.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Orchestration config not found: {config_path}")
+        
+        return self.server.load_orchestration(str(config_path))
+    
+    def list_orchestration_configs(self) -> List[str]:
+        """List available orchestration configs"""
+        configs = []
+        for file in self.config_directory.glob("*.yaml"):
+            configs.append(file.stem)
+        return configs
+    
+    def get_orchestration(self, name: str) -> Optional[A2AOrchestrator]:
+        """Get loaded orchestration"""
+        return self.server.get_orchestration(name)
+    
+    def discover_agents(self, **filters) -> List[AgentCard]:
+        """Discover agents"""
+        return self.server.discover_agents(**filters)
+    
+    def get_network_status(self) -> Dict:
+        """Get network status"""
+        return self.server.get_network_status()
+    
+    async def execute_workflow(
+        self,
+        orchestration_name: str,
+        workflow_name: str,
+        input_data: str
+    ) -> Dict:
+        """Execute a workflow"""
+        orchestration = self.get_orchestration(orchestration_name)
+        if not orchestration:
+            raise ValueError(f"Orchestration {orchestration_name} not loaded")
+        
+        return await orchestration.execute_workflow(workflow_name, input_data)
+    
+    async def chat_with_orchestration(
+        self,
+        orchestration_name: str,
+        user_input: str
+    ) -> str:
+        """Interactive chat with orchestration"""
+        orchestration = self.get_orchestration(orchestration_name)
+        if not orchestration:
+            raise ValueError(f"Orchestration {orchestration_name} not loaded")
+        
+        return await orchestration.run_interactive(user_input)
+
+
+# ============================================================================
+# Add to nexus/nexus_base/nexus.py
+# ============================================================================
+# Add this to the Nexus class __init__ method:
+#
+# from nexus.nexus_base.a2a_manager import A2AManager
+#
+# self.a2a_manager = A2AManager(self)
+#
+# Add these methods to the Nexus class:
+
+def get_a2a_manager(self):
+    """Get A2A manager"""
+    return self.a2a_manager
+
+async def start_a2a_server(self):
+    """Start A2A server"""
+    await self.a2a_manager.start_server()
+
+def load_a2a_orchestration(self, config_name: str):
+    """Load A2A orchestration"""
+    return self.a2a_manager.load_orchestration(config_name)
+
+def list_a2a_orchestrations(self):
+    """List available A2A orchestrations"""
+    return self.a2a_manager.list_orchestration_configs()
+
+def get_a2a_network_status(self):
+    """Get A2A network status"""
+    return self.a2a_manager.get_network_status()
